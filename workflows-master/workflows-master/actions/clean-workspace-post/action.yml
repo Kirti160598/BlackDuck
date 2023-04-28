@@ -1,0 +1,6 @@
+name: 'Clean Workspace Post'
+description: 'Cleans the workspace after the workflow'
+runs:
+  using: 'node16'
+  main: 'noop.js'
+  post: 'rm_rf.js'

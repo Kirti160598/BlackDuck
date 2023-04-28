@@ -1,0 +1,6 @@
+name: 'docker logout POST'
+description: 'Logs out from all docker registries after workflow finished'
+runs:
+  using: 'node16'
+  main: 'noop.js'
+  post: 'docker_logout.js'

@@ -1,0 +1,73 @@
+name: code-sync-ng
+
+on:
+  workflow_call:
+    inputs:
+      workflows-ref:
+        description: "ref of the centralized workflows repo that was specified in 'jobs.<name>.uses'"
+        required: true
+        type: string
+      ng-repo-ssh-url:
+        default: git@gitlab.com:servicelayers/${{ github.event.repository.name }}.git
+        required: false
+        type: string
+    secrets:
+      GH_ACCESSTOKEN:
+        required: true
+        description: "GH PAT used for checking out the k8s-artifacts repo"
+      NG_REPO_SSH_PRIVATE_KEY:
+        required: true
+
+jobs:
+  code-sync:
+    runs-on: [self-hosted, linux, X64, build-node]
+
+    steps:
+      - name: init
+        uses: CIAM-Me-Identity/workflows/actions/init@init-v1
+        with:
+          checkout-workflows-ref: ${{ inputs.workflows-ref }}
+          checkout-workflows-token: ${{ secrets.GH_ACCESSTOKEN }}
+          post-clean: true
+          java-version: 11
+          maven-version: 3.8.6
+          gh-cli-version: 2.14.6
+          kustomize-version: 4.5.7
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          path: app
+
+      - name: set credentials for ciam-ng
+        uses: webfactory/ssh-agent@fc49353b67b2b7c1e0e6a600572d01a69f2672dd # v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.NG_REPO_SSH_PRIVATE_KEY }}
+
+      - name: fetch ciam-ng
+        run: |
+          set -o xtrace
+          cd app
+
+          git remote add ng ${{ inputs.ng-repo-ssh-url }}
+          git fetch --no-tags ng master:ng-master
+
+      - name: push and create PR
+        env:
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ACCESSTOKEN }}
+          GH_HOST: git.i.mercedes-benz.com
+        run: |
+          set -o xtrace
+          cd app
+
+          git push --force origin ng-master
+
+          if pr=$(gh pr list --base master --head ng-master --json url | jq -er .[].url); then
+            echo "PR already exists: $pr" && exit 0
+          fi
+
+          gh pr create \
+            --title "sync changes from CIAM-NG" \
+            --body "Please chose 'Rebase and Merge' to finish this PR." \
+            --base "master" \
+            --head "ng-master"

@@ -1,0 +1,178 @@
+name: build-push
+
+on:
+  workflow_call:
+    inputs:
+      workflows-ref:
+        description: "ref of the centralized workflows repo that was specified in 'jobs.<name>.uses'"
+        required: true
+        type: string
+      project-name:
+        default: ${{ github.event.repository.name }}
+        required: false
+        type: string
+      maven-defaults:
+        default: -B --settings .m2/settings.xml -P test-coverage,code-analysis
+        required: false
+        type: string
+      sonar-enabled:
+        default: false
+        required: false
+        type: boolean
+      sonar-host:
+        default: https://meident-sonar.dot.i.mercedes-benz.com
+        required: false
+        type: string
+      java-version:
+        default: 11
+        required: false
+        type: string
+      maven-version:
+        default: 3.8.6
+        required: false
+        type: string
+      gh-cli-version:
+        default: 2.14.6
+        required: false
+        type: string
+      kustomize-version:
+        default: 4.5.7
+        required: false
+        type: string
+    secrets:
+      GH_ACCESSTOKEN:
+        required: true
+        description: "GH PAT used for checking out workflows repo"
+      ARTIFACTORY_USERNAME:
+        required: true
+      ARTIFACTORY_PASSWORD:
+        required: true
+      SONARQUBE_TOKEN:
+        required: false
+      DEV_WORLD_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for dev-world
+        required: true
+      DEV_WORLD_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for dev-world
+        required: true
+      DEV_CHINA_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for dev-china
+        required: false
+      DEV_CHINA_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for dev-china
+        required: false
+
+env:
+  PROJECT_NAME: ${{ inputs.project-name }}
+  ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+  ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+jobs:
+  mvn-docker-sonar:
+    name: Build, Push, Analyze
+    runs-on: [self-hosted, linux, X64, build-node]
+
+    steps:
+      - name: init
+        uses: CIAM-Me-Identity/workflows/actions/init@init-v1
+        with:
+          checkout-workflows-ref: ${{ inputs.workflows-ref }}
+          checkout-workflows-token: ${{ secrets.GH_ACCESSTOKEN }}
+          post-clean: true
+          java-version: ${{ inputs.java-version }}
+          maven-version: ${{ inputs.maven-version }}
+          gh-cli-version: ${{ inputs.gh-cli-version }}
+          kustomize-version: ${{ inputs.kustomize-version }}
+
+      - name: 'checkout: app'
+        uses: actions/checkout@v2
+        with:
+          path: app
+
+      - name: Configure AWS
+        id: aws-credentials
+        uses: ./workflows/actions/configure-aws
+        with:
+          login-ecr: true
+          dev-world-aws-access-key-id: ${{ secrets.DEV_WORLD_AWS_ACCESS_KEY_ID }}
+          dev-world-aws-secret-access-key: ${{ secrets.DEV_WORLD_AWS_SECRET_ACCESS_KEY }}
+
+      - name: Build & Push
+        id: build-push
+        env:
+          AWS_CONFIG_FILE: ${{ steps.aws-credentials.outputs.profile-file }}
+          AWS_SHARED_CREDENTIALS_FILE: ${{ steps.aws-credentials.outputs.credentials-file }}
+          ECR_REGISTRY_DEV_EU: 316670741786.dkr.ecr.eu-central-1.amazonaws.com
+          ECR_REGISTRY_DEV_CN: 723527083861.dkr.ecr.cn-north-1.amazonaws.com.cn
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_HOST: git.i.mercedes-benz.com
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -o xtrace
+          cd app
+
+          # PR builds
+          if [[ "$GITHUB_HEAD_REF" ]]; then
+            GIT_BRANCH=${GITHUB_HEAD_REF}
+            SHORT_SHA=`echo ${{ github.event.pull_request.head.sha }} | cut -c1-7`
+          else # Branch builds
+            GIT_BRANCH=${GITHUB_REF#refs/heads/}
+            SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-7`
+          fi
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            pr_url=$(gh pr list --state open --head $GIT_BRANCH --json url --jq .[].url)
+            if [[ ! -z $pr_url ]]; then
+              echo "Open PR exists at $pr_url Skipping this branch-build."
+              echo "::set-output name=skip-execution::true"
+              exit 0
+            fi
+          fi
+
+          if ! [[ "$PROJECT_NAME" ]] && [[ "${{ github.event_name }}" == "schedule" ]]; then
+            PROJECT_NAME=`echo ${{github.repository}} | awk -F'/' '{print $2}'`
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]] && [[ "${{ github.event.action }}" =~ opened|edited|synchronize ]]; then
+            regex='/release .*'
+            if [[ "$PR_BODY" =~ $regex ]] ; then
+              if ! [[ ${BASH_REMATCH[0]} =~ major|minor|patch|none ]]; then
+                echo "::error::Please describe the correct release type in PR description /release (major|minor|patch|none)" && exit 1
+              else
+                echo "release type ${BASH_REMATCH[0]} present in PR desc" # continue release
+              fi
+            fi
+          fi
+
+          if test -f "./pom.xml"; then
+            mkdir -p .mvn && echo ${{ inputs.maven-defaults }} > .mvn/maven.config
+            current_mvn_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+
+            mvn_version=${current_mvn_version}-${GIT_BRANCH}-SNAPSHOT
+            mvn versions:set -DnewVersion=$mvn_version
+            mvn -U clean deploy
+          fi
+
+          image_tag=SNAPSHOT-${GIT_BRANCH}-${SHORT_SHA} # eg. SNAPSHOT-feature-ab1f5ae
+          if test -f "./Dockerfile"; then
+            if aws --profile dev-world ecr describe-images\
+              --registry-id 316670741786 --repository-name=$PROJECT_NAME --image-ids=imageTag=$image_tag; then
+              echo "$PROJECT_NAME:$image_tag found in AWS ECR. Skipping docker build & push."
+            else
+              docker build -t $PROJECT_NAME:$image_tag .
+              docker tag $PROJECT_NAME:$image_tag $ECR_REGISTRY_DEV_EU/$PROJECT_NAME:$image_tag
+              docker push $ECR_REGISTRY_DEV_EU/$PROJECT_NAME:$image_tag
+            fi
+          fi
+
+      - name: Sonar
+        if: (inputs.sonar-enabled == 'true' && steps.build-push.outputs.skip-execution != 'true')
+        env:
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+        run: |
+          set -o xtrace
+          cd app
+          mvn sonar:sonar \
+            -Dsonar.projectKey=com.daimler.ciam:$PROJECT_NAME \
+            -Dsonar.host.url=${{ inputs.sonar-host }} \
+            -Dsonar.login=$SONAR_TOKEN

@@ -1,0 +1,24 @@
+name: 'Setup Coverity'
+description: 'Download, cache and setup Coverity in the workspace. Download most recent license every time.'
+inputs:
+  coverity-version:
+    description: 'Version of Coverity that should be set up'
+    required: false
+  coverity-auth-file:
+    description: 'Content of Coverity auth file'
+    required: true
+  configure-language:
+    description: 'Configure Coverity to use this language'
+    required: false
+runs:
+  # instead of using 'node', we use 'composite' because this way we can evaluate defaults and pass them as ENV.
+  # otherwise, when setup-tools passes an empty value as coverity-version,
+  # a 'default' specified directly on the inputs will not take effect.
+  using: 'composite'
+  steps:
+    - env:
+        COVERITY_VERSION: ${{ inputs.coverity-version || '2022.12.0' }}
+        COVERITY_AUTH_FILE: ${{ inputs.coverity-auth-file }}
+        CONFIGURE_LANGUAGE: ${{ inputs.configure-language || 'java' }}
+      shell: bash
+      run: node workflows/actions/setup-coverity/dist/index.js

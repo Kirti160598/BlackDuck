@@ -1,0 +1,109 @@
+name: 'Configure AWS credentials + ECR login'
+description: 'manually configure AWS credentials in a file relative to workspace, optionally performs ECR login'
+inputs:
+  login-ecr:
+    description: whether to login to the ECR registries
+    required: false
+  dev-world-aws-access-key-id:
+    description: AWS_ACCESS_KEY_ID for dev-world
+    required: false
+  dev-world-aws-secret-access-key:
+    description: AWS_SECRET_ACCESS_KEY for dev-world
+    required: false
+  int-world-aws-access-key-id:
+    description: AWS_ACCESS_KEY_ID for int-world
+    required: false
+  int-world-aws-secret-access-key:
+    description: AWS_SECRET_ACCESS_KEY for int-world
+    required: false
+  prod-world-aws-access-key-id:
+    description: AWS_ACCESS_KEY_ID for prod-world
+    required: false
+  prod-world-aws-secret-access-key:
+    description: AWS_SECRET_ACCESS_KEY for prod-world
+    required: false
+  dev-china-aws-access-key-id:
+    description: AWS_ACCESS_KEY_ID for dev-china
+    required: false
+  dev-china-aws-secret-access-key:
+    description: AWS_SECRET_ACCESS_KEY for dev-china
+    required: false
+  int-china-aws-access-key-id:
+    description: AWS_ACCESS_KEY_ID for int-china
+    required: false
+  int-china-aws-secret-access-key:
+    description: AWS_SECRET_ACCESS_KEY for int-china
+    required: false
+
+outputs:
+  profile-file:
+    description: path to AWS profile file
+    value: ${{ steps.aws-credentials.outputs.profile-file }}
+  credentials-file:
+    description: path to AWS credentials file
+    value: ${{ steps.aws-credentials.outputs.credentials-file }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: configure aws credentials
+      id: aws-credentials
+      shell: bash
+      run: |
+        set -o xtrace
+
+        ecr_login_to=""
+        function add_profile() {
+          profile=$1 region=$2 reg_url=$3 access_key_id=$4 secret_access_key=$5
+
+          # only add profiles if secrets are provided
+          if ! [[ -z "$access_key_id" ]] && ! [[ -z "$secret_access_key" ]]; then
+            ecr_login_to="${ecr_login_to}$profile $region $reg_url\n"
+            cat << EOF >> aws_profile.file
+        [profile $profile]
+        region=$region
+        EOF
+
+            cat << EOF >> aws_credentials.file
+        [$profile]
+        aws_access_key_id=$access_key_id
+        aws_secret_access_key=$secret_access_key
+        EOF
+          fi
+        }
+
+        add_profile dev-world eu-central-1 316670741786.dkr.ecr.eu-central-1.amazonaws.com\
+          ${{ inputs.dev-world-aws-access-key-id }} ${{ inputs.dev-world-aws-secret-access-key }}
+        add_profile int-world eu-central-1 783453647384.dkr.ecr.eu-central-1.amazonaws.com\
+          ${{ inputs.int-world-aws-access-key-id }} ${{ inputs.int-world-aws-secret-access-key }}
+        add_profile prod-world eu-central-1 231935251138.dkr.ecr.eu-central-1.amazonaws.com\
+          ${{ inputs.prod-world-aws-access-key-id }} ${{ inputs.prod-world-aws-secret-access-key }}
+        add_profile dev-china cn-north-1 723527083861.dkr.ecr.cn-north-1.amazonaws.com.cn\
+          ${{ inputs.dev-china-aws-access-key-id }} ${{ inputs.dev-china-aws-secret-access-key }}
+        add_profile int-china cn-north-1 315650031369.dkr.ecr.cn-north-1.amazonaws.com.cn\
+          ${{ inputs.int-china-aws-access-key-id }} ${{ inputs.int-china-aws-secret-access-key }}
+
+        echo "::set-output name=ecr-login-to::$ecr_login_to"
+        echo "::set-output name=profile-file::$(realpath aws_profile.file)"
+        echo "::set-output name=credentials-file::$(realpath aws_credentials.file)"
+
+    - name: Logout docker POST
+      if: inputs.login-ecr == 'true'
+      uses: ./workflows/actions/docker-logout-post
+
+    - name: ECR login
+      shell: bash
+      if: inputs.login-ecr == 'true'
+      env:
+        AWS_CONFIG_FILE: ${{ steps.aws-credentials.outputs.profile-file }}
+        AWS_SHARED_CREDENTIALS_FILE: ${{ steps.aws-credentials.outputs.credentials-file }}
+      run: |
+        set -o xtrace
+        function ecr_login() {
+          profile=$1 region=$2 reg_url=$3
+          aws ecr get-login-password --profile $profile --region $region\
+            | docker login --username AWS --password-stdin $reg_url
+        }
+        echo -e "${{ steps.aws-credentials.outputs.ecr-login-to }}" | while read line; do
+          [[ -z $line ]] || ecr_login $line
+        done

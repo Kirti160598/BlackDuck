@@ -1,0 +1,10 @@
+name: 'Setup GH CLI'
+description: 'Download, cache and setup the GH CLI in the workspace'
+inputs:
+  gh-cli-version:
+    description: 'Version of the GitHub-CLI that should be set up'
+    required: false
+    default: '2.14.6'
+runs:
+  using: 'node16'
+  main: 'dist/index.js'

@@ -1,0 +1,182 @@
+name: ci-release
+
+on:
+  workflow_call:
+    inputs:
+      workflows-ref:
+        description: "ref of the centralized workflows repo that was specified in 'jobs.<name>.uses'"
+        required: true
+        type: string
+      project-name:
+        default: ${{ github.event.repository.name }}
+        required: false
+        type: string
+      maven-defaults:
+        default: -B --settings .m2/settings.xml -P test-coverage,code-analysis
+        required: false
+        type: string
+      java-version:
+        default: 11
+        required: false
+        type: string
+      maven-version:
+        default: 3.8.6
+        required: false
+        type: string
+      gh-cli-version:
+        default: 2.14.6
+        required: false
+        type: string
+      kustomize-version:
+        default: 4.5.7
+        required: false
+        type: string
+      python-version:
+        default: 3.11
+        required: false
+        type: string
+    secrets:
+      GH_ACCESSTOKEN:
+        required: true
+        description: "GH PAT used for checking out workflows repo"
+      ARTIFACTORY_USERNAME:
+        required: true
+      ARTIFACTORY_PASSWORD:
+        required: true
+      DEV_WORLD_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for dev-world
+        required: true
+      DEV_WORLD_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for dev-world
+        required: true
+      INT_WORLD_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for int-world
+        required: true
+      INT_WORLD_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for int-world
+        required: true
+      DEV_CHINA_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for dev-china
+        required: false
+      DEV_CHINA_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for dev-china
+        required: false
+      INT_CHINA_AWS_ACCESS_KEY_ID:
+        description: AWS_ACCESS_KEY_ID for int-china
+        required: false
+      INT_CHINA_AWS_SECRET_ACCESS_KEY:
+        description: AWS_SECRET_ACCESS_KEY for int-china
+        required: false
+
+env:
+  PROJECT_NAME: ${{ inputs.project-name }}
+  ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+  ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+jobs:
+  release:
+    name: Build, Release
+    if: github.event.pull_request.merged == true
+    runs-on: [self-hosted, linux, X64, build-node]
+    steps:
+      - name: init
+        uses: CIAM-Me-Identity/workflows/actions/init@init-v1
+        with:
+          checkout-workflows-ref: ${{ inputs.workflows-ref }}
+          checkout-workflows-token: ${{ secrets.GH_ACCESSTOKEN }}
+          post-clean: true
+          java-version: ${{ inputs.java-version }}
+          maven-version: ${{ inputs.maven-version }}
+          gh-cli-version: ${{ inputs.gh-cli-version }}
+          kustomize-version: ${{ inputs.kustomize-version }}
+          python-version: ${{ inputs.python-version }}
+
+      - name: 'checkout: app'
+        uses: actions/checkout@v2
+        with:
+          path: app
+          token: ${{ secrets.GH_ACCESSTOKEN }}
+
+      - name: 'checkout: meid'
+        uses: actions/checkout@v2
+        with:
+          path: meid
+          repository: CIAM-Me-Identity/meid
+          token: ${{ secrets.GH_ACCESSTOKEN }}
+
+      - run: python -m pip install --upgrade --editable . pip -r requirements.txt
+        working-directory: meid
+
+      - name: Configure AWS
+        id: aws-credentials
+        uses: ./workflows/actions/configure-aws
+        with:
+          login-ecr: true
+          dev-world-aws-access-key-id: ${{ secrets.DEV_WORLD_AWS_ACCESS_KEY_ID }}
+          dev-world-aws-secret-access-key: ${{ secrets.DEV_WORLD_AWS_SECRET_ACCESS_KEY }}
+          int-world-aws-access-key-id: ${{ secrets.INT_WORLD_AWS_ACCESS_KEY_ID }}
+          int-world-aws-secret-access-key: ${{ secrets.INT_WORLD_AWS_SECRET_ACCESS_KEY }}
+
+      - name: Release
+        id: release
+        working-directory: app
+        env:
+          AWS_CONFIG_FILE: ${{ steps.aws-credentials.outputs.profile-file }}
+          AWS_SHARED_CREDENTIALS_FILE: ${{ steps.aws-credentials.outputs.credentials-file }}
+          ECR_REGISTRY_DEV_EU: 316670741786.dkr.ecr.eu-central-1.amazonaws.com
+          ECR_REGISTRY_INT_EU: 783453647384.dkr.ecr.eu-central-1.amazonaws.com
+          ECR_REGISTRY_DEV_CN: 723527083861.dkr.ecr.cn-north-1.amazonaws.com.cn
+          ECR_REGISTRY_INT_CN: 315650031369.dkr.ecr.cn-north-1.amazonaws.com.cn
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ACCESSTOKEN }}
+          GH_HOST: git.i.mercedes-benz.com
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -o xtrace
+          mkdir -p .mvn && echo ${{ inputs.maven-defaults }} > .mvn/maven.config
+
+          regex='/release (major|minor|patch)'
+          if [[ "$PR_BODY" =~ $regex ]] ; then
+            release_type=${BASH_REMATCH[1]}
+            meid set-version --increment $release_type
+            release_version=$(meid get-version)
+
+            if test -f "./pom.xml"; then
+              mvn -U clean deploy
+            fi
+
+            image_tag=$release_version  # eg. 1.0.0
+            if test -f "./Dockerfile"; then
+              if aws --profile dev-world ecr describe-images\
+                --registry 316670741786 --repository-name=$PROJECT_NAME --image-ids=imageTag=$image_tag; then
+                echo "$PROJECT_NAME:$image_tag found in AWS ECR. Skipping docker build & push."
+              else
+                docker build -t $PROJECT_NAME:$image_tag .
+                docker tag $PROJECT_NAME:$image_tag $ECR_REGISTRY_DEV_EU/$PROJECT_NAME:$image_tag
+                docker push $ECR_REGISTRY_DEV_EU/$PROJECT_NAME:$image_tag
+                docker tag $PROJECT_NAME:$image_tag $ECR_REGISTRY_INT_EU/$PROJECT_NAME:$image_tag
+                docker push $ECR_REGISTRY_INT_EU/$PROJECT_NAME:$image_tag
+              fi
+            fi
+
+            kustomization_files=`find kustomize -name kustomization.yaml -not -path "*/base/*"`
+            for kustomization_file in ${kustomization_files}; do
+              test -f "$kustomization_file" || continue
+              yq e -i "(.images[] | select(.name == \"$PROJECT_NAME\") | .newTag) |= \"$release_version\"" $kustomization_file
+              yq e -i "(.labels[].pairs | select(.version != null) | .version) |= \"$release_version\"" $kustomization_file
+              git add $kustomization_file
+            done
+
+            git config --add safe.directory "$GITHUB_WORKSPACE"
+            git config user.name PID7749
+            git config user.email meidentity-technical@mercedes-benz.com
+            git commit -m "CI: Increment version to [$release_version]"
+            git push origin master
+
+            if git tag -l "$release_version" | grep -q $release_version; then
+              echo "::error::git tag $release_version already exists, Please upgrade to appropriate version with <MAJOR>, <MINOR> OR <PATCH> " && exit 1
+            else
+              git tag $release_version
+              git push origin $release_version
+              gh release create $release_version --generate-notes
+            fi
+          fi

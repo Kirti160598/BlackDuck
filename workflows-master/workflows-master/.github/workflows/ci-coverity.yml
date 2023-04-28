@@ -1,0 +1,105 @@
+name: ci-coverity
+
+on:
+  workflow_call:
+    inputs:
+      workflows-ref:
+        description: "ref of the centralized workflows repo that was specified in 'jobs.<name>.uses'"
+        required: true
+        type: string
+      project-name:
+        default: ${{ github.event.repository.name }}
+        required: false
+        type: string
+      maven-defaults:
+        default: -B --settings .m2/settings.xml -P test-coverage,code-analysis
+        required: false
+        type: string
+      java-version:
+        default: 11
+        required: false
+        type: string
+      maven-version:
+        default: 3.8.6
+        required: false
+        type: string
+      coverity-configure-language:
+        default: java
+        required: false
+        type: string
+    secrets:
+      GH_ACCESSTOKEN:
+        required: true
+        description: "GH PAT used for checking out workflows repo"
+      COVERITY_AUTH_FILE:
+        required: true
+      ARTIFACTORY_USERNAME:
+        required: true
+      ARTIFACTORY_PASSWORD:
+        required: true
+
+env:
+  PROJECT_NAME: ${{ inputs.project-name }}
+  COVERITY_AUTH_FILE: ${{ secrets.COVERITY_AUTH_FILE }}
+  ARTIFACTORY_USERNAME: ${{ secrets.ARTIFACTORY_USERNAME }}
+  ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+jobs:
+  coverity:
+    runs-on: [self-hosted, linux, X64, build-node]
+
+    steps:
+      - name: init
+        uses: CIAM-Me-Identity/workflows/actions/init@init-v1
+        with:
+          checkout-workflows-ref: ${{ inputs.workflows-ref }}
+          checkout-workflows-token: ${{ secrets.GH_ACCESSTOKEN }}
+          post-clean: true
+          java-version: ${{ inputs.java-version }}
+          maven-version: ${{ inputs.maven-version }}
+          node-version: 18
+          jfrog-cli-version: latest
+          jfrog-user: ${{ secrets.ARTIFACTORY_USERNAME }}
+          jfrog-password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          coverity-configure-language: ${{ inputs.coverity-configure-language }}
+          coverity-auth-file: ${{ secrets.COVERITY_AUTH_FILE }}
+
+      - name: 'checkout: app'
+        uses: actions/checkout@v2
+        with:
+          path: app
+
+      - name: coverity
+        working-directory: app
+        run: |
+          # keep this part before xtrace option
+          auth_file_path="../cov-auth"
+          echo $COVERITY_AUTH_FILE >> $auth_file_path
+          chmod 700 $auth_file_path
+
+          set -o xtrace
+          if ! [[ "$PROJECT_NAME" ]] && [[ "${{ github.event_name }}" == "schedule" ]]; then
+            PROJECT_NAME=`echo ${{github.repository}} | awk -F'/' '{print $2}'`
+          fi
+          default_branch=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+          if [[ $GITHUB_REF_NAME == $default_branch ]]; then
+            stream="--stream 35167-$PROJECT_NAME-$default_branch"
+          else
+            # when fixing issues, developers can manually trigger a scan.
+            # these results should not overwrite master scan results, so we use '-default' stream.
+            # dynamic stream creation to always match actual feature-branch name is not needed.
+            stream="--stream 35167-$PROJECT_NAME-default"
+          fi
+          url="--url https://cov-connect.daimler.com"
+
+          if test -f "./pom.xml"; then
+            mkdir -p .mvn && echo ${{ inputs.maven-defaults }} > .mvn/maven.config
+            cov-build          --dir ../cov mvn clean compile -DskipTests=true
+          else
+            echo Unsupported project language. Only java supported as of now.
+            exit 1
+          fi
+
+          cov-import-scm     --dir ../cov --scm git
+          cov-analyze        --dir ../cov --disable-spotbugs
+          cov-commit-defects --dir ../cov --scm git $url $stream --auth-key-file $auth_file_path
