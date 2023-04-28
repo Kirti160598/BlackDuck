@@ -107,6 +107,7 @@ jobs:
           GH_ENTERPRISE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_HOST: git.i.mercedes-benz.com
           PR_BODY: ${{ github.event.pull_request.body }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -o xtrace
           cd app
@@ -176,3 +177,11 @@ jobs:
             -Dsonar.projectKey=com.daimler.ciam:$PROJECT_NAME \
             -Dsonar.host.url=${{ inputs.sonar-host }} \
             -Dsonar.login=$SONAR_TOKEN
+            
+        - name: Slack Notification
+          uses: act10ns/slack@v1
+          with: 
+             status: ${{ job.status }}
+             steps: ${{ toJson(steps) }}
+             channel: '#project'
+          if: always()
